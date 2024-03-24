@@ -161,12 +161,8 @@ def errata_records_to_oval(records: List[models.NewErrataRecord]):
         timestamp=datetime.datetime.utcnow(),
     )
     oval.generator = generator
-    # TODO:
-    # * add gpg_keys info platform
-    # * Ensure that packages in OVAL data refer to the right sign key, see
-    #   https://github.com/AlmaLinux/build-system/issues/205
     gpg_keys = {
-        "8": "51D6647EC21AD6EA",
+        "8": "2AE81E8ACED7258B",
         "9": "D36CB86CB86B3716",
     }
     objects = set()
