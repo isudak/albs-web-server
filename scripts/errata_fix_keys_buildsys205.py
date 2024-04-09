@@ -16,7 +16,7 @@ from copy import deepcopy
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel
 from sqlalchemy import and_, asc, desc, select
@@ -27,6 +27,7 @@ from sqlalchemy.orm import selectinload
 sys.path.append(str(Path(__file__).parent.parent))
 from alws import models
 from alws.dependencies import get_db
+
 # fmt: on
 
 
@@ -34,7 +35,7 @@ from alws.dependencies import get_db
 AL8_GPG_KEY_UPDATE_DATE = datetime(2024, 1, 15)
 AL8_NEW_KEY_GPG_ID = '2ae81e8aced7258b'
 AL8_OLD_KEY_GPG_ID = '51d6647ec21ad6ea'
-AL8_NAME = 'AlmaLinux-8'
+AL8_PLATFORM_ID = 1
 
 
 class FixAlma8ErrataKeys:
@@ -46,6 +47,7 @@ class FixAlma8ErrataKeys:
         db: AsyncSession,
         backup_dir: Optional[Path] = None,
         backup_before_update: bool = False,
+
     ):
         """
         Initialize FixAlma8ErrataKeys instance.
@@ -53,6 +55,7 @@ class FixAlma8ErrataKeys:
         Args:
             dry_run (bool): Flag indicating whether to perform a dry run.
             db (AsyncSession): Asynchronous database session.
+            platform_id of AlmaLinux
             backup_dir (Optional[Path], optional):
                 Directory to store backups. Defaults to None.
             backup_before_update (bool, optional):
@@ -63,21 +66,7 @@ class FixAlma8ErrataKeys:
         self.dry_run = dry_run
         self.backup_dir = backup_dir
         self.backup_before_update = backup_before_update
-
-    async def get_alma8_platform_id(self) -> int:
-        """
-        Retrieve the platform ID for AlmaLinux 8.
-
-        Returns:
-            int: Platform ID.
-        """
-        stmt = select(models.Platform.id).where(
-            models.Platform.name == AL8_NAME
-        )
-        platform_id = await self.db.scalar(stmt)
-        if not platform_id:
-            raise ValueError(f'Cant find platform_id for {AL8_NAME}')
-        return platform_id
+        platform_id = platform_id
 
     async def get_errata_record(
         self, errata_record_id: str
@@ -92,7 +81,6 @@ class FixAlma8ErrataKeys:
             Optional[models.NewErrataRecord]:
                 Errata record if found, else None.
         """
-        platform_id = await self.get_alma8_platform_id()
         query = (
             select(models.NewErrataRecord)
             .options(
@@ -103,7 +91,7 @@ class FixAlma8ErrataKeys:
             )
             .where(
                 and_(
-                    models.NewErrataRecord.platform_id == platform_id,
+                    models.NewErrataRecord.platform_id == AL8_PLATFORM_ID,
                     models.NewErrataRecord.id == errata_record_id,
                 )
             )
@@ -111,25 +99,26 @@ class FixAlma8ErrataKeys:
         errata_record = await self.db.scalar(query)
         return errata_record
 
-    async def get_errata_record_build_id(
+    async def get_errata_record_build_ids(
         self, errata_record: models.NewErrataRecord
-    ) -> Optional[str]:
+    ) -> Optional[Set[str]]:
         """
-        Retrieve the build ID associated with an errata record.
+        Retrieve the build IDs associated with an errata record.
 
         Args:
             errata_record (models.NewErrataRecord): Errata record.
 
         Returns:
-            Optional[str]: Build ID if found, else None.
+            Optional[Set[str]]: Set of Build IDs. None if we failed to extract any
         """
-        build_id = None
+        build_ids = set()
         for package in errata_record.packages:
-            if not package.albs_packages:
-                continue
-            build_id = package.albs_packages[0].build_id
-            break
-        return build_id
+            if package.albs_packages:
+                build_ids.update([ap.build_id for ap in package.albs_packages
+                                  if ap.build_id])
+        if build_ids:
+            return build_ids
+        return None
 
     async def get_latest_sign_task_ts(
         self, build_id: str
@@ -158,20 +147,8 @@ class FixAlma8ErrataKeys:
         newest_ts = await self.db.scalar(select_sign_task_ts_stmt)
         return newest_ts
 
-    def backup_state(self, errata_record_id: str, state: List[Dict[str, Any]]):
-        """
-        Backup the state of an errata record.
-
-        Args:
-            errata_record_id (str): Errata record ID.
-            state (List[Dict[str, Any]]): State to be backed up.
-        """
-        backup_file_path = self.backup_dir / f'{errata_record_id}.json'
-        with open(backup_file_path, 'w', encoding='utf-8') as fle:
-            json.dump(state, fle, indent=2)
-
     async def get_expected_key_id(
-        self, errata_record_id: str
+        self, errata_record: models.NewErrataRecord
     ) -> Optional[str]:
         """
         Retrieve the expected GPG key ID for an errata record.
@@ -182,21 +159,36 @@ class FixAlma8ErrataKeys:
         Returns:
             Optional[str]: Expected GPG key ID if found, else None.
         """
-        build_id = await self.get_errata_record_build_id(errata_record_id)
-        if not build_id:
-            logging.error('Cant extract build_id from %s', errata_record_id)
-            return None
-        newest_sign_task_ts = await self.get_latest_sign_task_ts(build_id)
-        if not newest_sign_task_ts:
-            logging.error(
-                'Cant get timestamp of the latest sign task for build %s',
-                build_id,
-            )
+        build_ids = await self.get_errata_record_build_ids(errata_record)
+        if not build_ids:
+            logging.error('Cant extract build_ids from %s', errata_record.id)
             return None
 
-        if newest_sign_task_ts < AL8_GPG_KEY_UPDATE_DATE:
+        build_id_to_newest_sign_task_ts = {}
+        newest_sign_tasks_ts = []
+        for build_id in build_ids:
+            newest_sign_task_ts = await self.get_latest_sign_task_ts(build_id)
+            if not newest_sign_task_ts:
+                logging.warning(
+                    'Cant get timestamp of the latest sign task for build %s',
+                    build_id,
+                )
+            else:
+                build_id_to_newest_sign_task_ts[build_id] = newest_sign_task_ts
+                newest_sign_tasks_ts.append(newest_sign_task_ts)
+        if not newest_sign_task_ts:
+            logging.error('Cant get timestamp of the latest sign task \
+                            for all builds %s', build_ids)
+            return None
+
+        if all(ts < AL8_GPG_KEY_UPDATE_DATE for ts in newest_sign_tasks_ts):
             return AL8_OLD_KEY_GPG_ID
-        return AL8_NEW_KEY_GPG_ID
+        elif all(ts > AL8_GPG_KEY_UPDATE_DATE for ts in newest_sign_tasks_ts):
+            return AL8_NEW_KEY_GPG_ID
+        else:
+            logging.error('Some build tasks have sign tasks created before %s and some after: %s',
+                          AL8_GPG_KEY_UPDATE_DATE, build_id_to_newest_sign_task_ts)
+            return None
 
     async def update_state(
         self, expected_key_id: str, errata_record: models.NewErrataRecord
@@ -224,11 +216,7 @@ class FixAlma8ErrataKeys:
         if update_needed:
             assert len(errata_record.original_states) == len(new_states)
             if self.backup_before_update:
-                backup_record = {
-                    'original': errata_record.original_states,
-                    'updated': new_states,
-                }
-                self.backup_state(errata_record.id, backup_record)
+                self.backup_errata_record(errata_record=errata_record)
             if not self.dry_run:
                 logging.info(
                     'Updating original_states for %s', errata_record.id
@@ -252,7 +240,7 @@ class FixAlma8ErrataKeys:
             return
         try:
             with open(backup_file, 'r') as fle:
-                backuped_state = json.load(fle)['original']
+                backuped_state = ErrataRecordBackup(**json.load(fle))
         except Exception as e:  # pylint: disable=W0718
             logging.error('Cant load state %s: %s', backup_file, str(e))
             return
@@ -295,10 +283,36 @@ class FixAlma8ErrataKeys:
             return
         await self.update_state(expected_key_id, errata_record)
 
+    async def backup_errata_record(self, errata_record_id: str = None,
+                                   errata_record: models.NewErrataRecord = None):
+        """
+        Backup errata record.
+
+        Args:
+            errata_record_id (str): Errata record ID.
+            errata_record (models.NewErrataRecord): errata record itself
+        """
+        if errata_record:
+            errata_record_backup = ErrataRecordBackup(tests=errata_record.tests,
+                                                      objects=errata_record.objects,
+                                                      states=errata_record.states)
+        elif errata_record_id:
+            loc_errata_record = await self.get_errata_record(errata_record_id)
+            errata_record_backup = ErrataRecordBackup(tests=loc_errata_record.tests,
+                                                      objects=loc_errata_record.objects,
+                                                      states=loc_errata_record.states)
+        else:
+            raise ValueError(
+                "Both errata_record_id and errata_record cannot be none")
+        backup_file_path = self.backup_dir / f'{errata_record_id}.json'
+        with open(backup_file_path, 'w', encoding='utf-8') as fle:
+            json.dump(errata_record_backup, fle, indent=2)
+
 
 class ActionType(str, Enum):
     fix = "fix"
     restore = "restore"
+    backup = "backup"
 
 
 class Args(BaseModel):
@@ -312,6 +326,12 @@ class Args(BaseModel):
     class Config:
         use_enum_values = True
         validate_assignment = True
+
+
+class ErrataRecordBackup(BaseModel):
+    tests: List[Dict[str, Any]]
+    objects: List[Dict[str, Any]]
+    states: List[Dict[str, Any]]
 
 
 logging.basicConfig(
@@ -350,7 +370,8 @@ def parse_args() -> Args:
         default=ActionType.fix.value,
         required=False,
         help="fix: fix errata records, \
-                            restore: restore previously backed up records",
+              restore: restore previously backed up records, \
+              backup: just dump errata records without any changes",
     )
     parser.add_argument(
         '--issue_date_from',
@@ -393,26 +414,9 @@ def parse_args() -> Args:
     return Args(**vars(args))
 
 
-async def get_alma8_platform_id(db: AsyncSession) -> int:
+async def get_almalinux8_errata_ids(db: AsyncSession, args: Args):
     """
-    Retrieve the platform ID for AlmaLinux 8.
-
-    Args:
-        db (AsyncSession): Asynchronous database session.
-
-    Returns:
-        int: Platform ID.
-    """
-    stmt = select(models.Platform.id).where(models.Platform.name == AL8_NAME)
-    platform_id = await db.scalar(stmt)
-    if not platform_id:
-        raise ValueError(f'Cant get platform_id for {AL8_NAME}')
-    return platform_id
-
-
-async def get_almalinux8_errata_ids_to_fix(db: AsyncSession, args: Args):
-    """
-    Retrieve the IDs of AlmaLinux 8 errata records to fix.
+    Retrieve the IDs of AlmaLinux 8 errata records to fix/dump.
 
     Args:
         db (AsyncSession): Asynchronous database session.
@@ -421,12 +425,12 @@ async def get_almalinux8_errata_ids_to_fix(db: AsyncSession, args: Args):
     Returns:
         List[str]: List of errata record IDs.
     """
-    platform_id = await get_alma8_platform_id(db)
+
     stmt = (
         select(models.NewErrataRecord.id)
         .where(
             and_(
-                models.NewErrataRecord.platform_id == platform_id,
+                models.NewErrataRecord.platform_id == AL8_PLATFORM_ID,
                 models.NewErrataRecord.issued_date.between(
                     args.issue_date_from, args.issue_date_to
                 ),
@@ -456,7 +460,7 @@ async def fix_records(args: Args):
             backup_dir=full_backup_dir,
             backup_before_update=args.backup_before_update,
         )
-        errata_ids = await get_almalinux8_errata_ids_to_fix(db, args)
+        errata_ids = await get_almalinux8_errata_ids(db, args)
         for errata_id in errata_ids:
             logging.info('%s', errata_id)
             await fixer.fix_errata_gpg_key(errata_id)
@@ -475,6 +479,15 @@ async def restore_records_from_backup(backup_dir: Path):
     async with asynccontextmanager(get_db)() as db:
         fixer = FixAlma8ErrataKeys(dry_run=False, db=db, backup_dir=backup_dir)
         await fixer.restore()
+
+
+async def dump(args: Args, db: AsyncSession):
+    """
+    Dumping objects/states/tests for Errata records
+    """
+    errata_ids = await get_almalinux8_errata_ids(db, args)
+    for errata_id in errata_ids:
+        logging.info('%s', errata_id)
 
 
 async def main():
